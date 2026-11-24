@@ -1,21 +1,28 @@
-//! The Anthropic login's localhost callback server on the registered
-//! redirect port. Only a matching redirect settles the login; error
-//! responses, missing parameters, and unknown routes answer their
-//! page and keep waiting. A bind failure is a hard error.
+//! The localhost callback server behind the browser redirect of the
+//! subscription logins (Anthropic and the Google AI Pro/Ultra flow). Only a
+//! matching redirect settles the login; error responses, missing parameters,
+//! and unknown routes answer their page and keep waiting. A bind failure is a
+//! hard error.
 
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use url::Url;
+
+use super::types::{OAuthLoginUi, OAuthPrompt};
 
 pub(crate) const CALLBACK_HOST_ENV: &str = "PI_OAUTH_CALLBACK_HOST";
 
-/// The registered redirect port (the registration's, not a scan
-/// range).
-pub(crate) const CALLBACK_PORT: u16 = 53_692;
-pub(crate) const CALLBACK_PATH: &str = "/callback";
-/// The exchange's `redirect_uri` in every path.
-pub(crate) const REDIRECT_URI: &str = "http://localhost:53692/callback";
+/// One loopback redirect registration: the port and route the provider is
+/// registered on, and the service named on the callback pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallbackRoute {
+    pub port: u16,
+    pub path: &'static str,
+    pub service: &'static str,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallbackCode {
@@ -51,14 +58,14 @@ impl CallbackShared {
 /// Dropping aborts the accept loop, releasing the port — a settled or cancelled
 /// login never wedges the registered port.
 #[derive(Debug)]
-pub struct AnthropicCallbackServer {
+pub struct LocalCallbackServer {
     shared: Arc<CallbackShared>,
     #[cfg(test)]
     port: u16,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
-impl Drop for AnthropicCallbackServer {
+impl Drop for LocalCallbackServer {
     fn drop(&mut self) {
         if let Some(task) = self.task.take() {
             task.abort();
@@ -66,16 +73,16 @@ impl Drop for AnthropicCallbackServer {
     }
 }
 
-impl AnthropicCallbackServer {
-    /// Bind the registered redirect port on the callback host; a bind failure is the login's hard
-    /// error.
+impl LocalCallbackServer {
+    /// Bind the route's registered redirect port on the callback host; a bind
+    /// failure is the login's hard error.
     ///
     /// # Errors
     ///
     /// Returns an error when the listener cannot be bound.
-    pub fn start(state: &str) -> Result<Self, String> {
+    pub fn start(route: CallbackRoute, state: &str) -> Result<Self, String> {
         let host = std::env::var(CALLBACK_HOST_ENV).unwrap_or_else(|_| "127.0.0.1".to_string());
-        Self::bind(&host, CALLBACK_PORT, state)
+        Self::bind(&host, route.port, route, state)
     }
 
     /// Bind one exact host and port; the caller owns the failure.
@@ -83,7 +90,7 @@ impl AnthropicCallbackServer {
     /// # Errors
     ///
     /// Returns an error when the listener cannot be bound.
-    pub fn bind(host: &str, port: u16, state: &str) -> Result<Self, String> {
+    pub fn bind(host: &str, port: u16, route: CallbackRoute, state: &str) -> Result<Self, String> {
         // `SO_REUSEADDR`: lingering TIME_WAIT connections on the
         // registered port must not fail the next login's bind. Unix
         // only: on Windows the flag instead lets a second socket bind
@@ -123,11 +130,11 @@ impl AnthropicCallbackServer {
                 let shared = Arc::clone(&task_shared);
                 let state = state.clone();
                 tokio::spawn(async move {
-                    serve_callback(stream, &shared, &state).await;
+                    serve_callback(stream, &shared, route, &state).await;
                 });
             }
         });
-        Ok(AnthropicCallbackServer {
+        Ok(LocalCallbackServer {
             shared,
             #[cfg(test)]
             port: bound_port,
@@ -160,7 +167,12 @@ impl AnthropicCallbackServer {
 
 /// One browser request: read it, answer it, settle the login only on
 /// a matching redirect.
-async fn serve_callback(mut stream: tokio::net::TcpStream, shared: &CallbackShared, state: &str) {
+async fn serve_callback(
+    mut stream: tokio::net::TcpStream,
+    shared: &CallbackShared,
+    route: CallbackRoute,
+    state: &str,
+) {
     let Some(request) = read_request_head(&mut stream).await else {
         let _ = write_response(
             &mut stream,
@@ -178,7 +190,7 @@ async fn serve_callback(mut stream: tokio::net::TcpStream, shared: &CallbackShar
         .nth(1)
         .unwrap_or_default();
     let path = target.split('?').next().unwrap_or_default();
-    if path != CALLBACK_PATH {
+    if path != route.path {
         let _ = write_response(
             &mut stream,
             "404 Not Found",
@@ -195,7 +207,7 @@ async fn serve_callback(mut stream: tokio::net::TcpStream, shared: &CallbackShar
             &mut stream,
             "400 Bad Request",
             error_page(
-                "Anthropic authentication did not complete.",
+                &format!("{} authentication did not complete.", route.service),
                 Some(&format!("Error: {error}")),
             ),
         )
@@ -232,7 +244,10 @@ async fn serve_callback(mut stream: tokio::net::TcpStream, shared: &CallbackShar
     let _ = write_response(
         &mut stream,
         "200 OK",
-        success_page("Anthropic authentication completed. You can close this window."),
+        success_page(&format!(
+            "{} authentication completed. You can close this window.",
+            route.service
+        )),
     )
     .await;
 }
@@ -323,15 +338,13 @@ fn escape_html(value: &str) -> String {
 /// The callback pages: a dark minimal page carrying the login's
 /// outcome; the TS flow's wording rides the messages and details.
 fn render_page(title: &str, message: &str, details: Option<&str>) -> String {
-    let details_html = details
-        .map(|details| {
-            format!(
-                r#"    <div class="details">{}</div>
+    let details_html = details.map_or_default(|details| {
+        format!(
+            r#"    <div class="details">{}</div>
 "#,
-                escape_html(details)
-            )
-        })
-        .unwrap_or_default();
+            escape_html(details)
+        )
+    });
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -372,13 +385,141 @@ fn error_page(message: &str, details: Option<&str>) -> String {
     render_page("Prime Agent authentication failed", message, details)
 }
 
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Wait for a login's authorization code: the browser callback wins over a late
+/// manual paste (the manual answer only cancels the server's wait), the cancel
+/// flag is re-checked between poll steps, and a paste is accepted in the URL,
+/// `code=&state=`, `code#state`, or bare-code form with the echoed state checked
+/// against `state`. `prompt` asks for the paste when neither path produced a
+/// code; `cancelled` is the error a cancelled login reports.
+///
+/// # Errors
+///
+/// Returns an error when the login is cancelled or the echoed state mismatches.
+pub(crate) async fn wait_for_authorization_code(
+    server: &LocalCallbackServer,
+    ui: &dyn OAuthLoginUi,
+    state: &str,
+    prompt: &OAuthPrompt,
+    cancelled: &str,
+) -> Result<CallbackCode, String> {
+    let manual = ui.on_manual_code_input();
+    let manual_available = manual.is_some();
+    let manual_answer = async {
+        match manual {
+            Some(future) => future.await,
+            None => std::future::pending::<Option<String>>().await,
+        }
+    };
+    tokio::pin!(manual_answer);
+    // The browser redirect wins over a late manual paste: the manual
+    // answer only cancels the server's wait (TS `server.cancelWait`).
+    // The browser redirect wins over a late manual paste: the manual
+    // answer only cancels the server's wait.
+    let wait = server.wait_for_code();
+    tokio::pin!(wait);
+    let mut tick = tokio::time::interval(CANCEL_POLL_INTERVAL);
+    let raced = loop {
+        if ui.is_cancelled() {
+            return Err(cancelled.to_string());
+        }
+        tokio::select! {
+            _ = tick.tick() => {}
+            code = &mut wait => break RaceOutcome::Callback(code),
+            answer = &mut manual_answer => break RaceOutcome::Manual(answer),
+        }
+    };
+    let code: Option<CallbackCode> = match raced {
+        RaceOutcome::Callback(Some(code)) => Some(code),
+        RaceOutcome::Callback(None) => {
+            if manual_available {
+                match manual_answer.await {
+                    None => return Err(cancelled.to_string()),
+                    Some(input) => parse_paste(&input, state)?,
+                }
+            } else {
+                None
+            }
+        }
+        RaceOutcome::Manual(None) => return Err(cancelled.to_string()),
+        RaceOutcome::Manual(Some(input)) => parse_paste(&input, state)?,
+    };
+    if let Some(code) = code {
+        return Ok(code);
+    }
+    let answer = ui.on_prompt(prompt).await;
+    let input = answer.ok_or_else(|| cancelled.to_string())?;
+    parse_paste(&input, state)?.ok_or_else(|| "Missing authorization code".to_string())
+}
+
+enum RaceOutcome {
+    /// The code, or `None` on a settled-empty wait.
+    Callback(Option<CallbackCode>),
+    /// The paste input, or `None` when cancelled.
+    Manual(Option<String>),
+}
+
+pub(crate) fn parse_paste(input: &str, verifier: &str) -> Result<Option<CallbackCode>, String> {
+    let (code, echoed) = parse_authorization_input(input);
+    if let Some(echoed) = &echoed {
+        if echoed != verifier {
+            return Err("OAuth state mismatch".to_string());
+        }
+    }
+    Ok(code.map(|code| CallbackCode {
+        code,
+        state: echoed.unwrap_or_else(|| verifier.to_string()),
+    }))
+}
+
+pub(crate) fn parse_authorization_input(input: &str) -> (Option<String>, Option<String>) {
+    let value = input.trim();
+    if value.is_empty() {
+        return (None, None);
+    }
+    let non_empty = |value: Option<String>| value.filter(|value| !value.is_empty());
+    if let Ok(url) = Url::parse(value) {
+        let get = |name: &str| {
+            non_empty(
+                url.query_pairs()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.to_string()),
+            )
+        };
+        return (get("code"), get("state"));
+    }
+    if value.contains('#') {
+        let mut parts = value.splitn(2, '#');
+        let code = parts.next().unwrap_or_default();
+        let state = parts.next().unwrap_or_default();
+        return (
+            non_empty(Some(code.to_string())),
+            non_empty(Some(state.to_string())),
+        );
+    }
+    if value.contains("code=") {
+        let get = |name: &str| {
+            non_empty(
+                url::form_urlencoded::parse(value.as_bytes())
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.to_string()),
+            )
+        };
+        return (get("code"), get("state"));
+    }
+    (non_empty(Some(value.to_string())), None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn live(state: &str) -> (AnthropicCallbackServer, u16) {
-        let server = AnthropicCallbackServer::bind("127.0.0.1", 0, state)
+    use crate::oauth::anthropic::{ANTHROPIC_ROUTE, CALLBACK_PORT};
+
+    fn live(state: &str) -> (LocalCallbackServer, u16) {
+        let server = LocalCallbackServer::bind("127.0.0.1", 0, ANTHROPIC_ROUTE, state)
             .expect("a free loopback port binds");
         let port = server.port();
         (server, port)
@@ -444,7 +585,7 @@ mod tests {
     /// would hang here.
     #[tokio::test]
     async fn a_settle_in_the_registration_window_still_wakes() {
-        let server = AnthropicCallbackServer::bind("127.0.0.1", 0, "the-state")
+        let server = LocalCallbackServer::bind("127.0.0.1", 0, ANTHROPIC_ROUTE, "the-state")
             .expect("a free loopback port binds");
         let shared = &server.shared;
         // The settle lands before the wait registers.

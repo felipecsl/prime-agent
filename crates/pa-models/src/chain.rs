@@ -176,6 +176,18 @@ impl ModelCatalog {
                 None => self.compiled.as_ref().clone(),
             },
         };
+        // The Antigravity subscription roster ships in the binary: its runtime ids come from the
+        // account's discovery call, so the shared catalog never carries the provider and no
+        // existing entry can announce it.
+        for compiled in self.compiled.iter() {
+            if compiled.provider == "google-antigravity"
+                && !base.iter().any(|existing| {
+                    existing.provider == "google-antigravity" && existing.id == compiled.id
+                })
+            {
+                base.push(compiled.clone());
+            }
+        }
         if base.iter().any(|model| model.provider == "google") {
             for compiled in self.compiled.iter() {
                 if compiled.provider == "google"
@@ -357,8 +369,8 @@ mod tests {
         let models = catalog.resolve(None);
         assert_eq!(
             models.len(),
-            111,
-            "1 pinned bundled entry + 110 offline prime-inference entries"
+            115,
+            "1 pinned bundled entry + 110 offline prime-inference entries + 4 compiled Antigravity rows"
         );
         assert!(models.iter().any(|m| m.id == "bundled-a"));
     }
@@ -608,5 +620,57 @@ mod tests {
             .find(|m| m.id == "gemini-4-argon")
             .expect("argon");
         assert_eq!(argon.name, "Gemini 4 Argon (Remote)");
+    }
+
+    /// The shared catalog carries no `google-antigravity` rows (its runtime ids come from the
+    /// account's discovery call), so a loaded catalog must still surface the compiled roster.
+    #[test]
+    fn the_compiled_antigravity_roster_survives_a_loaded_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = json!({
+            "url": MODEL_CATALOG_URL,
+            "scope": PUBLIC_SCOPE,
+            "fetchedAt": 1,
+            "payload": json!({
+                "schemaVersion": 1,
+                "models": [{
+                    "id": "gemini-2.5-flash",
+                    "name": "Gemini 2.5 Flash",
+                    "api": "google-generative-ai",
+                    "provider": "google",
+                    "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
+                    "reasoning": true,
+                    "input": ["text", "image"],
+                    "cost": {"input": 0.3, "output": 2.5, "cacheRead": 0.03, "cacheWrite": 0},
+                    "contextWindow": 1_048_576,
+                    "maxTokens": 65_536,
+                }]
+            }),
+        });
+        std::fs::write(
+            dir.path().join(PROVIDER_CATALOG_CACHE_FILE),
+            serde_json::to_string(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let catalog =
+            ModelCatalog::with_bundled_dir(Some(dir.path().into()), Some(dir.path().into()));
+        let mut ids: Vec<String> = catalog
+            .resolve(None)
+            .into_iter()
+            .filter(|model| model.provider == "google-antigravity")
+            .map(|model| model.id)
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            [
+                "gemini-4-argon",
+                "gemini-4-carbon",
+                "gemini-4-hydrogen",
+                "gemini-4-neon"
+            ]
+            .map(str::to_string)
+        );
     }
 }

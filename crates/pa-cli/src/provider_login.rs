@@ -14,9 +14,10 @@ use pa_tui::provider_auth::{
 };
 
 /// The subscription login providers (every flow ported).
-const SUBSCRIPTION_PROVIDERS: [(&str, &str); 4] = [
+const SUBSCRIPTION_PROVIDERS: [(&str, &str); 5] = [
     ("anthropic", "Anthropic (Claude Pro/Max)"),
     ("github-copilot", "GitHub Copilot"),
+    ("google-antigravity", "Google AI Pro/Ultra (Antigravity)"),
     ("openai-codex", "ChatGPT Plus/Pro (Codex Subscription)"),
     ("xai", "xAI (Grok)"),
 ];
@@ -69,6 +70,12 @@ fn display_name(provider_id: &str) -> String {
     BUILT_IN_PROVIDER_DISPLAY_NAMES
         .iter()
         .find(|(id, _)| *id == provider_id)
+        // A subscription-only provider has no API-key display name; its subscription row names it.
+        .or_else(|| {
+            SUBSCRIPTION_PROVIDERS
+                .iter()
+                .find(|(id, _)| *id == provider_id)
+        })
         .map_or_else(|| provider_id.to_string(), |(_, name)| name.to_string())
 }
 
@@ -632,6 +639,31 @@ fn login_blocking_on_panel(
                 },
                 |runtime| {
                     runtime.block_on(crate::subscription_login::run_xai_login(
+                        &agent_dir,
+                        &provider_row.name,
+                        &pa_ai::oauth::ReqwestProviderHttp::new(),
+                        &crate::subscription_login::PanelSubscriptionLoginUi::new(
+                            panel,
+                            &provider_row.id,
+                        ),
+                    ))
+                },
+            );
+    }
+    // The Google AI Pro/Ultra (Antigravity) login.
+    if provider_row.id == pa_core::auth::GOOGLE_ANTIGRAVITY_PROVIDER_ID {
+        return tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_or_else(
+                |error: std::io::Error| {
+                    ProviderAuthOutcome::Error(format!(
+                        "Failed to login to {}: {error}",
+                        provider_row.name
+                    ))
+                },
+                |runtime| {
+                    runtime.block_on(crate::subscription_login::run_google_antigravity_login(
                         &agent_dir,
                         &provider_row.name,
                         &pa_ai::oauth::ReqwestProviderHttp::new(),

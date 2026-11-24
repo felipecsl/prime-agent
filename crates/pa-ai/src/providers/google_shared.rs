@@ -13,6 +13,8 @@ pub use crate::providers::google_stream::GoogleStreamState;
 
 pub const API_GOOGLE_GENERATIVE_AI: &str = "google-generative-ai";
 pub const API_GOOGLE_VERTEX: &str = "google-vertex";
+/// Antigravity subscription backend, reached through the Cloud Code Assist `v1internal` API.
+pub const API_GOOGLE_ANTIGRAVITY: &str = "google-antigravity";
 
 /// Thinking level values accepted by Gemini 3+, Gemini 4, and Gemma 4 models
 /// (`GoogleThinkingLevel`).

@@ -116,6 +116,7 @@ pub fn register_builtin_api_providers() {
         Arc::new(crate::providers::azure_openai_responses::AzureOpenAIResponsesProvider),
         Arc::new(crate::providers::google::GoogleGenerativeAiProvider),
         Arc::new(crate::providers::google_vertex::GoogleVertexProvider),
+        Arc::new(crate::providers::google_antigravity::GoogleAntigravityProvider),
         Arc::new(crate::providers::mistral::MistralConversationsProvider),
         Arc::new(crate::providers::bedrock::BedrockConverseStreamProvider),
         Arc::new(crate::providers::openai_codex_responses::OpenAICodexResponsesProvider),

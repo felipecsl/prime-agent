@@ -3,12 +3,12 @@
 //! token exchange, and the refresh. The TS flow doubles its PKCE
 //! verifier as the OAuth `state` — kept for wire parity.
 
-use std::time::Duration;
-
 use serde_json::json;
 use url::Url;
 
-use super::anthropic_callback::{AnthropicCallbackServer, CallbackCode, REDIRECT_URI};
+use super::local_callback::{
+    wait_for_authorization_code, CallbackCode, CallbackRoute, LocalCallbackServer,
+};
 use super::pkce::generate_pkce;
 use super::provider_http::{ProviderHttp, ProviderHttpMethod, ProviderHttpRequest};
 use super::types::{OAuthLoginUi, OAuthPrompt};
@@ -17,6 +17,11 @@ use super::types::{OAuthLoginUi, OAuthPrompt};
 /// value.
 pub const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
+/// The registered redirect port (the registration's, not a scan range), the
+/// callback route, and the exchange's `redirect_uri` in every path.
+pub(crate) const CALLBACK_PORT: u16 = 53_692;
+const CALLBACK_PATH: &str = "/callback";
+const REDIRECT_URI: &str = "http://localhost:53692/callback";
 const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 pub const DEFAULT_TOKEN_TIMEOUT_MS: u64 = 30_000;
@@ -24,12 +29,18 @@ const EXPIRY_SKEW_MS: i64 = 5 * 60 * 1000;
 /// The refresh runs under the auth store's file lock, which a peer declares stale after 10 seconds;
 /// the request must fit inside that window.
 pub const REFRESH_TIMEOUT_MS: u64 = 8_000;
+/// The loopback registration this flow's callback listens on.
+pub(crate) const ANTHROPIC_ROUTE: CallbackRoute = CallbackRoute {
+    port: CALLBACK_PORT,
+    path: CALLBACK_PATH,
+    service: "Anthropic",
+};
+
 const AUTH_INSTRUCTIONS: &str =
     "Complete login in your browser. If the browser is on another machine, paste the final redirect URL here.";
 const PROMPT_MESSAGE: &str = "Paste the authorization code or full redirect URL:";
 /// The cancel error the driving surface maps to the silent cancelled outcome.
 pub const LOGIN_CANCELLED: &str = "Login cancelled";
-const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnthropicCredentials {
@@ -54,7 +65,7 @@ pub async fn login_anthropic(
         return Err(LOGIN_CANCELLED.to_string());
     }
     let (verifier, challenge) = generate_pkce();
-    let server = AnthropicCallbackServer::start(&verifier)?;
+    let server = LocalCallbackServer::start(ANTHROPIC_ROUTE, &verifier)?;
     login_with_server(http, ui, &server, &verifier, &challenge).await
 }
 
@@ -64,7 +75,7 @@ pub async fn login_anthropic(
 async fn login_with_server(
     http: &dyn ProviderHttp,
     ui: &dyn OAuthLoginUi,
-    server: &AnthropicCallbackServer,
+    server: &LocalCallbackServer,
     verifier: &str,
     challenge: &str,
 ) -> Result<AnthropicCredentials, String> {
@@ -72,7 +83,18 @@ async fn login_with_server(
         &authorization_url(challenge, verifier),
         Some(AUTH_INSTRUCTIONS),
     );
-    let code = wait_for_code(server, ui, verifier).await?;
+    let code = wait_for_authorization_code(
+        server,
+        ui,
+        verifier,
+        &OAuthPrompt {
+            message: PROMPT_MESSAGE.to_string(),
+            placeholder: Some(REDIRECT_URI.to_string()),
+            allow_empty: false,
+        },
+        LOGIN_CANCELLED,
+    )
+    .await?;
     if ui.is_cancelled() {
         return Err(LOGIN_CANCELLED.to_string());
     }
@@ -122,122 +144,6 @@ fn authorization_url(challenge: &str, verifier: &str) -> String {
         url.query_pairs_mut().append_pair(name, value);
     }
     url.to_string()
-}
-
-async fn wait_for_code(
-    server: &AnthropicCallbackServer,
-    ui: &dyn OAuthLoginUi,
-    verifier: &str,
-) -> Result<CallbackCode, String> {
-    let manual = ui.on_manual_code_input();
-    let manual_available = manual.is_some();
-    let manual_answer = async {
-        match manual {
-            Some(future) => future.await,
-            None => std::future::pending::<Option<String>>().await,
-        }
-    };
-    tokio::pin!(manual_answer);
-    // The browser redirect wins over a late manual paste: the manual
-    // answer only cancels the server's wait (TS `server.cancelWait`).
-    let wait = server.wait_for_code();
-    tokio::pin!(wait);
-    let mut tick = tokio::time::interval(CANCEL_POLL_INTERVAL);
-    let raced = loop {
-        if ui.is_cancelled() {
-            return Err(LOGIN_CANCELLED.to_string());
-        }
-        tokio::select! {
-            _ = tick.tick() => {}
-            code = &mut wait => break RaceOutcome::Callback(code),
-            answer = &mut manual_answer => break RaceOutcome::Manual(answer),
-        }
-    };
-    let code: Option<CallbackCode> = match raced {
-        RaceOutcome::Callback(Some(code)) => Some(code),
-        RaceOutcome::Callback(None) => {
-            if manual_available {
-                match manual_answer.await {
-                    None => return Err(LOGIN_CANCELLED.to_string()),
-                    Some(input) => parse_paste(&input, verifier)?,
-                }
-            } else {
-                None
-            }
-        }
-        RaceOutcome::Manual(None) => return Err(LOGIN_CANCELLED.to_string()),
-        RaceOutcome::Manual(Some(input)) => parse_paste(&input, verifier)?,
-    };
-    if let Some(code) = code {
-        return Ok(code);
-    }
-    let answer = ui
-        .on_prompt(&OAuthPrompt {
-            message: PROMPT_MESSAGE.to_string(),
-            placeholder: Some(REDIRECT_URI.to_string()),
-            allow_empty: false,
-        })
-        .await;
-    let input = answer.ok_or_else(|| LOGIN_CANCELLED.to_string())?;
-    parse_paste(&input, verifier)?.ok_or_else(|| "Missing authorization code".to_string())
-}
-
-enum RaceOutcome {
-    /// The code, or `None` on a settled-empty wait.
-    Callback(Option<CallbackCode>),
-    /// The paste input, or `None` when cancelled.
-    Manual(Option<String>),
-}
-
-fn parse_paste(input: &str, verifier: &str) -> Result<Option<CallbackCode>, String> {
-    let (code, echoed) = parse_authorization_input(input);
-    if let Some(echoed) = &echoed {
-        if echoed != verifier {
-            return Err("OAuth state mismatch".to_string());
-        }
-    }
-    Ok(code.map(|code| CallbackCode {
-        code,
-        state: echoed.unwrap_or_else(|| verifier.to_string()),
-    }))
-}
-
-fn parse_authorization_input(input: &str) -> (Option<String>, Option<String>) {
-    let value = input.trim();
-    if value.is_empty() {
-        return (None, None);
-    }
-    let non_empty = |value: Option<String>| value.filter(|value| !value.is_empty());
-    if let Ok(url) = Url::parse(value) {
-        let get = |name: &str| {
-            non_empty(
-                url.query_pairs()
-                    .find(|(key, _)| key == name)
-                    .map(|(_, value)| value.to_string()),
-            )
-        };
-        return (get("code"), get("state"));
-    }
-    if value.contains('#') {
-        let mut parts = value.splitn(2, '#');
-        let code = parts.next().unwrap_or_default();
-        let state = parts.next().unwrap_or_default();
-        return (
-            non_empty(Some(code.to_string())),
-            non_empty(Some(state.to_string())),
-        );
-    }
-    if value.contains("code=") {
-        let get = |name: &str| {
-            non_empty(
-                url::form_urlencoded::parse(value.as_bytes())
-                    .find(|(key, _)| key == name)
-                    .map(|(_, value)| value.to_string()),
-            )
-        };
-        return (get("code"), get("state"));
-    }
-    (non_empty(Some(value.to_string())), None)
 }
 
 struct TokenResponse {
@@ -374,6 +280,7 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use tokio::io::AsyncWriteExt as _;
 
     /// A scripted transport: url -> response, recording every posted
@@ -553,7 +460,7 @@ mod tests {
         ui: &ScriptedUi,
     ) -> Result<AnthropicCredentials, String> {
         let (verifier, challenge) = generate_pkce();
-        let server = AnthropicCallbackServer::bind("127.0.0.1", 0, &verifier)
+        let server = LocalCallbackServer::bind("127.0.0.1", 0, ANTHROPIC_ROUTE, &verifier)
             .expect("a free loopback port binds");
         login_with_server(http, ui, &server, &verifier, &challenge).await
     }
@@ -679,7 +586,7 @@ mod tests {
         let http = Arc::new(token_http());
         let ui = Arc::new(ScriptedUi::new(Some(ScriptedAnswer::Pending), None));
         let (verifier, challenge) = generate_pkce();
-        let server = AnthropicCallbackServer::bind("127.0.0.1", 0, &verifier)
+        let server = LocalCallbackServer::bind("127.0.0.1", 0, ANTHROPIC_ROUTE, &verifier)
             .expect("a free loopback port binds");
         let port = server.port();
         let flow_ui = Arc::clone(&ui);
@@ -727,6 +634,7 @@ mod tests {
 
     #[test]
     fn the_paste_parse_matches_the_ts_table() {
+        use crate::oauth::local_callback::{parse_authorization_input, parse_paste};
         let url = "http://localhost:53692/callback?code=abc&state=st";
         assert_eq!(
             parse_authorization_input(url),

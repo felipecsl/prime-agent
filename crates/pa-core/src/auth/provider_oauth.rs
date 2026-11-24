@@ -5,8 +5,9 @@
 use std::sync::Arc;
 
 use pa_ai::oauth::{
-    refresh_anthropic_token, refresh_github_copilot_token, refresh_openai_codex_token,
-    refresh_xai_token, CodexHttp, ProviderHttp, ReqwestCodexHttp, ReqwestProviderHttp,
+    refresh_anthropic_token, refresh_github_copilot_token, refresh_google_antigravity_token,
+    refresh_openai_codex_token, refresh_xai_token, CodexHttp, ProviderHttp, ReqwestCodexHttp,
+    ReqwestProviderHttp,
 };
 
 use crate::auth::types::{AuthCredential, AuthStorageData};
@@ -19,6 +20,8 @@ pub const ANTHROPIC_PROVIDER_ID: &str = "anthropic";
 pub const GITHUB_COPILOT_PROVIDER_ID: &str = "github-copilot";
 /// The xAI (Grok) subscription provider id.
 pub const XAI_PROVIDER_ID: &str = "xai";
+/// The Google AI Pro/Ultra (Antigravity) subscription provider id.
+pub const GOOGLE_ANTIGRAVITY_PROVIDER_ID: &str = "google-antigravity";
 
 /// The AI library's oauth registry as the auth storage's default
 /// integration.
@@ -161,7 +164,26 @@ impl ProviderOAuth {
                             audience_mode: None,
                         })
                     }
-                    // The match arms cover the four subscription ids;
+                    GOOGLE_ANTIGRAVITY_PROVIDER_ID => {
+                        let credentials = runtime.block_on(refresh_google_antigravity_token(
+                            provider_http.as_ref(),
+                            &refresh_token,
+                        ))?;
+                        Ok(AuthCredential::Oauth {
+                            access: credentials.access,
+                            refresh: Some(credentials.refresh),
+                            expires: credentials.expires,
+                            account_id: None,
+                            enterprise_url: None,
+                            endpoint: None,
+                            token_endpoint: None,
+                            client_id: None,
+                            resource: None,
+                            issuer: None,
+                            audience_mode: None,
+                        })
+                    }
+                    // The match arms cover the five subscription ids;
                     // `refresh` never dispatches another.
                     _ => Err("no token refresh for this provider".to_string()),
                 }
@@ -191,6 +213,7 @@ impl crate::auth::OAuthIntegration for ProviderOAuth {
                 | ANTHROPIC_PROVIDER_ID
                 | GITHUB_COPILOT_PROVIDER_ID
                 | XAI_PROVIDER_ID
+                | GOOGLE_ANTIGRAVITY_PROVIDER_ID
         ) {
             return Err(format!("{provider_id} has no token refresh"));
         }

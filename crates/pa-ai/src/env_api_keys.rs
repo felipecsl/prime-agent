@@ -17,6 +17,8 @@ pub fn get_api_key_env_vars(provider: &str) -> Option<Vec<&'static str>> {
                 "prime-inference" => "PRIME_API_KEY",
                 "deepseek" => "DEEPSEEK_API_KEY",
                 "google-vertex" => "GOOGLE_CLOUD_API_KEY",
+                // A Google OAuth access token pa-core minted, or a hand-set one.
+                "google-antigravity" => "GOOGLE_ANTIGRAVITY_API_KEY",
                 "groq" => "GROQ_API_KEY",
                 "cerebras" => "CEREBRAS_API_KEY",
                 "xai" => "XAI_API_KEY",

@@ -17,6 +17,7 @@ pub fn default_model_per_provider(provider: &str) -> Option<&'static str> {
         "deepseek" => "deepseek-v4-pro",
         "google" => "gemini-4-neon",
         "google-vertex" => "gemini-3.1-pro-preview",
+        "google-antigravity" => "gemini-4-neon",
         "openrouter" => "moonshotai/kimi-k2.6",
         "vercel-ai-gateway" => "zai/glm-5.1",
         "xai" => "grok-4.20-0309-reasoning",
