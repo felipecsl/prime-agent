@@ -154,7 +154,7 @@ impl ModelCatalog {
     /// the live Prime Inference snapshot for `credentials` when given.
     /// Never fails; never blocks on the network.
     pub fn resolve(&self, credentials: Option<&PrimeCredentials>) -> Vec<Model> {
-        let base = match self.provider_cache.get(PUBLIC_SCOPE) {
+        let mut base = match self.provider_cache.get(PUBLIC_SCOPE) {
             Some(remote) => {
                 // Step 1: validated last-good cache + the compiled offline
                 // Prime Inference entries (private/live entries come from
@@ -176,6 +176,18 @@ impl ModelCatalog {
                 None => self.compiled.as_ref().clone(),
             },
         };
+        if base.iter().any(|model| model.provider == "google") {
+            for compiled in self.compiled.iter() {
+                if compiled.provider == "google"
+                    && compiled.id.starts_with("gemini-4-")
+                    && !base
+                        .iter()
+                        .any(|existing| existing.provider == "google" && existing.id == compiled.id)
+                {
+                    base.push(compiled.clone());
+                }
+            }
+        }
         let live = credentials
             .and_then(|credentials| self.prime_inference.get(&credentials.as_inference()));
         match live {
@@ -525,5 +537,76 @@ mod tests {
         let account_a = account("sk-a", "team-a");
         assert!(catalog.credentials_changed(Some(&account_a)));
         assert!(!catalog.credentials_changed(Some(&account_a)));
+    }
+
+    #[test]
+    fn remote_google_catalog_merges_missing_compiled_gemini4_models_without_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let google_payload = json!({
+            "schemaVersion": 1,
+            "models": [
+                {
+                    "id": "gemini-2.5-flash",
+                    "name": "Gemini 2.5 Flash",
+                    "api": "google-generative-ai",
+                    "provider": "google",
+                    "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
+                    "reasoning": true,
+                    "input": ["text", "image"],
+                    "cost": {"input": 0.3, "output": 2.5, "cacheRead": 0.03, "cacheWrite": 0},
+                    "contextWindow": 1_048_576,
+                    "maxTokens": 65_536,
+                },
+                {
+                    "id": "gemini-4-argon",
+                    "name": "Gemini 4 Argon (Remote)",
+                    "api": "google-generative-ai",
+                    "provider": "google",
+                    "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
+                    "reasoning": true,
+                    "input": ["text", "image"],
+                    "cost": {"input": 2.0, "output": 10.0, "cacheRead": 0.1, "cacheWrite": 0},
+                    "contextWindow": 1_048_576,
+                    "maxTokens": 32_768,
+                },
+            ]
+        });
+        let snapshot = json!({
+            "url": MODEL_CATALOG_URL,
+            "scope": PUBLIC_SCOPE,
+            "fetchedAt": 1,
+            "payload": google_payload,
+        });
+        std::fs::write(
+            dir.path().join(PROVIDER_CATALOG_CACHE_FILE),
+            serde_json::to_string(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let catalog =
+            ModelCatalog::with_bundled_dir(Some(dir.path().into()), Some(dir.path().into()));
+        let google_models: Vec<Model> = catalog
+            .resolve(None)
+            .into_iter()
+            .filter(|model| model.provider == "google")
+            .collect();
+        let mut ids: Vec<&str> = google_models.iter().map(|m| m.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![
+                "gemini-2.5-flash",
+                "gemini-4-argon",
+                "gemini-4-carbon",
+                "gemini-4-hydrogen",
+                "gemini-4-neon",
+            ]
+        );
+        // An existing remote entry wins over the compiled fallback.
+        let argon = google_models
+            .iter()
+            .find(|m| m.id == "gemini-4-argon")
+            .expect("argon");
+        assert_eq!(argon.name, "Gemini 4 Argon (Remote)");
     }
 }

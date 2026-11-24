@@ -14,7 +14,8 @@ pub use crate::providers::google_stream::GoogleStreamState;
 pub const API_GOOGLE_GENERATIVE_AI: &str = "google-generative-ai";
 pub const API_GOOGLE_VERTEX: &str = "google-vertex";
 
-/// Thinking level values accepted by Gemini 3 models (`GoogleThinkingLevel`).
+/// Thinking level values accepted by Gemini 3+, Gemini 4, and Gemma 4 models
+/// (`GoogleThinkingLevel`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)] // full TS option surface; the UNSPECIFIED variant is accepted wire input
 pub enum GoogleThinkingLevel {
@@ -23,6 +24,7 @@ pub enum GoogleThinkingLevel {
     Low,
     Medium,
     High,
+    Xhigh,
 }
 
 impl GoogleThinkingLevel {
@@ -33,6 +35,7 @@ impl GoogleThinkingLevel {
             GoogleThinkingLevel::Low => "LOW",
             GoogleThinkingLevel::Medium => "MEDIUM",
             GoogleThinkingLevel::High => "HIGH",
+            GoogleThinkingLevel::Xhigh => "XHIGH",
         }
     }
 }
@@ -514,6 +517,7 @@ fn mapped_thinking_level(
         "LOW" => Some(GoogleThinkingLevel::Low),
         "MEDIUM" => Some(GoogleThinkingLevel::Medium),
         "HIGH" => Some(GoogleThinkingLevel::High),
+        "XHIGH" => Some(GoogleThinkingLevel::Xhigh),
         _ => None,
     }
 }
