@@ -8,13 +8,14 @@ pub fn get_api_key_env_vars(provider: &str) -> Option<Vec<&'static str>> {
         "github-copilot" => Some(vec!["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]),
         // ANTHROPIC_OAUTH_TOKEN takes precedence over ANTHROPIC_API_KEY.
         "anthropic" => Some(vec!["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]),
+        // GEMINI_API_KEY takes precedence over GEMINI_ACCESS_TOKEN (matching gemini-api-cli).
+        "google" => Some(vec!["GEMINI_API_KEY", "GEMINI_ACCESS_TOKEN"]),
         other => {
             let env_var = match other {
                 "openai" => "OPENAI_API_KEY",
                 "azure-openai-responses" => "AZURE_OPENAI_API_KEY",
                 "prime-inference" => "PRIME_API_KEY",
                 "deepseek" => "DEEPSEEK_API_KEY",
-                "google" => "GEMINI_API_KEY",
                 "google-vertex" => "GOOGLE_CLOUD_API_KEY",
                 "groq" => "GROQ_API_KEY",
                 "cerebras" => "CEREBRAS_API_KEY",
@@ -128,6 +129,10 @@ mod tests {
         assert_eq!(
             get_api_key_env_vars("anthropic").unwrap(),
             vec!["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]
+        );
+        assert_eq!(
+            get_api_key_env_vars("google").unwrap(),
+            vec!["GEMINI_API_KEY", "GEMINI_ACCESS_TOKEN"]
         );
         assert!(get_api_key_env_vars("unknown-provider").is_none());
     }

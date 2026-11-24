@@ -201,6 +201,53 @@ fn build_params(model: &Model, context: &Context, options: &GoogleOptions) -> Va
     Value::Object(body)
 }
 
+/// Append Gemini API authentication headers (either `x-goog-api-key` or OAuth `Authorization:
+/// Bearer`, plus optional `x-goog-user-project` for bearer auth) unless the caller already supplied
+/// an explicit `Authorization` or `x-goog-api-key` header.
+fn apply_auth_headers(
+    headers: &mut Vec<(String, String)>,
+    credential: &str,
+    api_key_env: Option<&str>,
+    access_token_env: Option<&str>,
+    user_project_env: Option<&str>,
+) {
+    let has_explicit_auth = headers.iter().any(|(name, _)| {
+        name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("x-goog-api-key")
+    });
+    if !has_explicit_auth {
+        let trimmed = credential.trim();
+        if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("bearer ") {
+            let token = trimmed[7..].trim();
+            if !token.is_empty() {
+                headers.push(("Authorization".into(), format!("Bearer {token}")));
+            }
+        } else {
+            let is_google_oauth_token = trimmed.starts_with("ya29.");
+            let from_access_token_env = !trimmed.is_empty()
+                && api_key_env.map(str::trim).is_none_or(str::is_empty)
+                && access_token_env
+                    .map(str::trim)
+                    .is_some_and(|env_token| !env_token.is_empty() && env_token == trimmed);
+            if is_google_oauth_token || from_access_token_env {
+                headers.push(("Authorization".into(), format!("Bearer {trimmed}")));
+            } else {
+                headers.push(("x-goog-api-key".into(), trimmed.to_string()));
+            }
+        }
+    }
+    let uses_bearer = headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
+    let has_user_project = headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("x-goog-user-project"));
+    if uses_bearer && !has_user_project {
+        if let Some(project) = user_project_env.map(str::trim).filter(|p| !p.is_empty()) {
+            headers.push(("x-goog-user-project".into(), project.to_string()));
+        }
+    }
+}
+
 // Long by design: mirrors the provider's stream shape.
 #[allow(clippy::too_many_lines)]
 async fn run_stream(
@@ -274,7 +321,19 @@ async fn run_stream(
         &model.provider,
         options.base.session_id.as_deref(),
     );
-    headers.push(("x-goog-api-key".into(), api_key));
+    let api_key_env = std::env::var("GEMINI_API_KEY").ok();
+    let access_token_env = std::env::var("GEMINI_ACCESS_TOKEN").ok();
+    let user_project_env = std::env::var("GEMINI_USER_PROJECT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| std::env::var("GOOGLE_CLOUD_QUOTA_PROJECT").ok());
+    apply_auth_headers(
+        &mut headers,
+        &api_key,
+        api_key_env.as_deref(),
+        access_token_env.as_deref(),
+        user_project_env.as_deref(),
+    );
 
     let mut response: HttpResponse = send(RequestOptions {
         method: reqwest::Method::POST,
@@ -592,6 +651,119 @@ mod tests {
                 json!({ "includeThoughts": true, "thinkingBudget": 2048 }),
                 json!({ "includeThoughts": true, "thinkingBudget": 8192 }),
                 json!({ "includeThoughts": true, "thinkingBudget": 24576 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn gemini4_xhigh_thinking_level_maps_to_xhigh() {
+        let model = serde_json::from_value::<Model>(json!({
+            "id": "gemini-4-neon", "name": "Gemini 4 Neon",
+            "api": "google-generative-ai", "provider": "google",
+            "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
+            "reasoning": true,
+            "thinkingLevelMap": {
+                "off": null, "minimal": null, "low": "low", "medium": "medium",
+                "high": "high", "xhigh": "xhigh", "max": null
+            },
+            "input": ["text", "image"],
+            "cost": { "input": 3.0, "output": 15.0, "cacheRead": 0.15, "cacheWrite": 0.0 },
+            "contextWindow": 1_048_576, "maxTokens": 65_536
+        }))
+        .unwrap();
+        let configs = [
+            ModelThinkingLevel::Low,
+            ModelThinkingLevel::Medium,
+            ModelThinkingLevel::High,
+            ModelThinkingLevel::Xhigh,
+            ModelThinkingLevel::Max,
+        ]
+        .map(|level| thinking_config(&model, level));
+        assert_eq!(
+            configs,
+            [
+                json!({ "includeThoughts": true, "thinkingLevel": "LOW" }),
+                json!({ "includeThoughts": true, "thinkingLevel": "MEDIUM" }),
+                json!({ "includeThoughts": true, "thinkingLevel": "HIGH" }),
+                json!({ "includeThoughts": true, "thinkingLevel": "XHIGH" }),
+                json!({ "includeThoughts": true, "thinkingLevel": "XHIGH" }),
+            ]
+        );
+    }
+
+    #[test]
+    fn auth_headers_select_api_key_or_bearer_with_optional_user_project() {
+        let mut api_key_headers = Vec::new();
+        apply_auth_headers(
+            &mut api_key_headers,
+            "AIzaSyTestKey",
+            Some("AIzaSyTestKey"),
+            None,
+            Some("quota-proj"),
+        );
+        assert_eq!(
+            api_key_headers,
+            vec![("x-goog-api-key".into(), "AIzaSyTestKey".into())]
+        );
+
+        let mut oauth_headers = Vec::new();
+        apply_auth_headers(
+            &mut oauth_headers,
+            "ya29.test-oauth-token",
+            None,
+            None,
+            Some("quota-proj"),
+        );
+        assert_eq!(
+            oauth_headers,
+            vec![
+                (
+                    "Authorization".into(),
+                    "Bearer ya29.test-oauth-token".into()
+                ),
+                ("x-goog-user-project".into(), "quota-proj".into()),
+            ]
+        );
+
+        let mut env_access_headers = Vec::new();
+        apply_auth_headers(
+            &mut env_access_headers,
+            "opaque-token",
+            None,
+            Some("opaque-token"),
+            None,
+        );
+        assert_eq!(
+            env_access_headers,
+            vec![("Authorization".into(), "Bearer opaque-token".into())]
+        );
+
+        let mut prefixed_bearer_headers = Vec::new();
+        apply_auth_headers(
+            &mut prefixed_bearer_headers,
+            "bearer custom-tok",
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            prefixed_bearer_headers,
+            vec![("Authorization".into(), "Bearer custom-tok".into())]
+        );
+
+        let mut explicit_headers = vec![("Authorization".into(), "Bearer from-config".into())];
+        apply_auth_headers(
+            &mut explicit_headers,
+            "AIzaSyIgnored",
+            Some("AIzaSyIgnored"),
+            None,
+            Some("quota-proj"),
+        );
+        assert_eq!(
+            explicit_headers,
+            vec![
+                ("Authorization".into(), "Bearer from-config".into()),
+                ("x-goog-user-project".into(), "quota-proj".into()),
             ]
         );
     }
